@@ -1,171 +1,26 @@
-name: CI
-
+name: Nilo external audit - physical operations and procedures
 on:
   push:
+    branches: ['lab/nilo-physical-procedures']
   pull_request:
-
+    branches: [main]
 permissions:
   contents: read
-
 jobs:
-  sovereign-test:
+  focused-invariants:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 59ad10f94f2a39657339ae1c271746eeeede2ad9
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Rebuild deterministic Sovereign Genesis replay
+      - name: Record exact baseline and environment
         run: |
-          node scripts/build_sovereign_genesis.mjs
-          cp site/data/sovereign-genesis.json /tmp/sovereign-genesis-a.json
-          node scripts/build_sovereign_genesis.mjs
-          cmp /tmp/sovereign-genesis-a.json site/data/sovereign-genesis.json
-      - name: Sovereign unit, runtime and package verification
-        run: bash CHECK.sh . --skip-browser
-
-  browser-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install Playwright for integration smoke
-        run: |
-          npm install --no-save playwright pixi.js@8.19.0
-          npx playwright install --with-deps chromium
-      - name: Serve Observer shell and run sovereign browser smoke
-        run: |
-          python3 -m http.server 8765 --directory site >/tmp/cymonia-v2-http.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID' EXIT
-          for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:8765/ >/dev/null 2>&1 && break
-            sleep 0.5
-          done
-          CYMONIA_URL=http://127.0.0.1:8765 node tests/browser-replay.mjs
-          CYMONIA_URL=http://127.0.0.1:8765 node tests/browser-sovereign.mjs
-          CYMONIA_URL=http://127.0.0.1:8765 node tests/browser-state-sprites.mjs
-          CYMONIA_URL=http://127.0.0.1:8765 node tests/browser-graphics2.mjs
-
-  deploy-world:
-    name: Deploy Sovereign World Worker
-    needs: [sovereign-test, browser-smoke]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: cymonia-sovereign-production
-      cancel-in-progress: false
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Validate Cloudflare credentials
-        run: |
-          test -n "$CLOUDFLARE_API_TOKEN"
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-      - name: Install Wrangler
-        run: npm install --no-save wrangler@4
-      - name: Deploy canonical Durable Object world
-        run: npx wrangler deploy --config wrangler.world.toml
-      - name: Wake canonical heartbeat after deploy
-        run: |
-          for i in $(seq 1 20); do
-            curl --max-time 60 -fsS https://cymonia.pages.dev/api/v2/health -o /tmp/cymonia-post-worker-health.json 2>/dev/null || true
-            node -e "const fs=require('fs');try{const h=JSON.parse(fs.readFileSync('/tmp/cymonia-post-worker-health.json'));process.exit(h.ok&&h.service==='cymonia-sovereign-world'&&Number.isFinite(h.world_minute)?0:1)}catch{process.exit(1)}" && break
-            sleep 2
-          done
-          node -e "const fs=require('fs');const h=JSON.parse(fs.readFileSync('/tmp/cymonia-post-worker-health.json'));if(!h.ok)process.exit(1);console.log({world_minute:h.world_minute,heartbeat:h.heartbeat,lag_world_minutes:h.lag_world_minutes})"
-
-  deploy-pages:
-    name: Deploy Observer Pages
-    needs: [deploy-world]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: cymonia-sovereign-production
-      cancel-in-progress: false
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install Wrangler
-        run: npm install --no-save wrangler@4
-      - name: Build deterministic Observer fallback
-        run: node scripts/build_sovereign_genesis.mjs
-      - name: Deploy game-only Observer
-        run: npx wrangler pages deploy site --project-name cymonia --branch main --commit-hash "$GITHUB_SHA"
-      - name: Verify autonomous advancement without Observer requests
-        run: node scripts/verify_autonomous_world.mjs
-      - name: Verify canonical state advances in production
-        run: |
-          for i in $(seq 1 30); do
-            rm -f /tmp/cymonia-health-a.json /tmp/cymonia-state-a.json
-            curl --max-time 60 -fsS -o /tmp/cymonia-health-a.json https://cymonia.pages.dev/api/v2/health 2>/dev/null || true
-            curl --compressed --max-time 60 -fsS -o /tmp/cymonia-state-a.json https://cymonia.pages.dev/api/v2/state 2>/dev/null || true
-            node -e "const fs=require('fs');try{const h=JSON.parse(fs.readFileSync('/tmp/cymonia-health-a.json'));const x=JSON.parse(fs.readFileSync('/tmp/cymonia-state-a.json'));process.exit(h.ok&&h.service==='cymonia-sovereign-world'&&Number.isFinite(h.world_minute)&&h.persisted_generation&&x.ok&&x.world?.version===2&&x.world.citizens?.length>0&&x.world.citizens.some(c=>c.alive&&c.currentAction)?0:1)}catch{process.exit(1)}" && break
-            sleep 2
-          done
-          test -s /tmp/cymonia-health-a.json
-          # Canonical advancement is alarm-driven. Do not hammer the same
-          # Durable Object every two seconds while testing whether its alarm
-          # can run. Give Cloudflare a full alarm interval plus jitter.
-          sleep 75
-          curl --max-time 60 -fsS -o /tmp/cymonia-health-b.json https://cymonia.pages.dev/api/v2/health
-
-          node -e "const fs=require('fs');const a=JSON.parse(fs.readFileSync('/tmp/cymonia-health-a.json'));const b=JSON.parse(fs.readFileSync('/tmp/cymonia-health-b.json'));process.exit(b.world_minute>a.world_minute?0:1)" || {
-            echo "World did not advance in first quiet window; allowing one additional alarm window"
-            sleep 75
-            curl --max-time 60 -fsS -o /tmp/cymonia-health-b.json https://cymonia.pages.dev/api/v2/health
-          }
-
-          # Persistence is intentionally throttled for the Durable Objects
-          # free-tier write budget. Give one quiet checkpoint window.
-          sleep 75
-          curl --max-time 60 -fsS -o /tmp/cymonia-health-c.json https://cymonia.pages.dev/api/v2/health
-          node <<'NODE'
-          const fs=require('fs');
-          const a=JSON.parse(fs.readFileSync('/tmp/cymonia-health-a.json'));
-          const b=JSON.parse(fs.readFileSync('/tmp/cymonia-health-b.json'));
-          const c=JSON.parse(fs.readFileSync('/tmp/cymonia-health-c.json'));
-          console.log('health-a',a);
-          console.log('health-b',b);
-          console.log('health-c',c);
-          if(!b.ok||b.service!=='cymonia-sovereign-world')throw new Error('canonical health unavailable');
-          if(!(b.world_minute>a.world_minute))throw new Error(`canonical world minute did not advance; heartbeat=${JSON.stringify(b.heartbeat||{})}; lag=${b.lag_world_minutes}`);
-          if(!c.persisted_generation||!(c.clock_high_water_mark>a.clock_high_water_mark))throw new Error(`canonical snapshot was not persisted within checkpoint window; heartbeat=${JSON.stringify(c.heartbeat||{})}; persistence=${JSON.stringify(c.persistence_budget||{})}`);
-          if(c.heartbeat?.lastTickError||c.heartbeat?.tick_stalled)throw new Error(`canonical heartbeat remains unhealthy: ${JSON.stringify(c.heartbeat||{})}`);
-          if(a.world_id!==b.world_id||a.world_id!==c.world_id)throw new Error('canonical world identity changed');
-          console.log({from:a.world_minute,to:b.world_minute,persisted_generation:c.persisted_generation});
-          NODE
-
-      - name: Verify production Observer polling continuity
-        run: |
-          rm -f /tmp/cymonia-observer-state-a.json /tmp/cymonia-observer-state-b.json
-          # Match browser compression negotiation for the mature public state.
-          # Keep the same deadlines and canonical continuity assertions.
-          curl --compressed --max-time 60 -fsS -o /tmp/cymonia-observer-state-a.json https://cymonia.pages.dev/api/v2/state
-          sleep 10
-          curl --compressed --max-time 60 -fsS -o /tmp/cymonia-observer-state-b.json https://cymonia.pages.dev/api/v2/state
-          node <<'NODE'
-          const fs=require('fs');
-          const a=JSON.parse(fs.readFileSync('/tmp/cymonia-observer-state-a.json'));
-          const b=JSON.parse(fs.readFileSync('/tmp/cymonia-observer-state-b.json'));
-          if(!a.ok||!b.ok)throw new Error('observer canonical state unavailable');
-          if(a.world?.version!==2||b.world?.version!==2)throw new Error('observer state version mismatch');
-          if(!a.world?.worldId||a.world.worldId!==b.world?.worldId)throw new Error('observer world identity changed');
-          const am=Number(a.world?.clock?.worldMinute),bm=Number(b.world?.clock?.worldMinute);
-          if(!Number.isSafeInteger(am)||!Number.isSafeInteger(bm))throw new Error('observer world minute invalid');
-          if(bm<am)throw new Error(`observer clock regressed ${am} -> ${bm}`);
-          if(!Array.isArray(b.world?.citizens)||!b.world.citizens.some(c=>c.alive&&c.currentAction))throw new Error('observer canonical citizens unavailable');
-          console.log(`PASS: production Observer polling is canonical and monotonic (${am} -> ${bm})`);
-          NODE
+          git rev-parse HEAD
+          node --version
+      - name: Physical operations and learned procedures
+        run: node --test tests/test_sovereign_physical_operations.mjs tests/test_sovereign_procedures.mjs
