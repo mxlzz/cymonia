@@ -24,3 +24,5 @@ jobs:
           node --version
       - name: Physical operations and learned procedures
         run: node --test tests/test_sovereign_physical_operations.mjs tests/test_sovereign_procedures.mjs
+
+# Retry after repository Actions permissions verification.
